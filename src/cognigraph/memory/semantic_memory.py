@@ -7,7 +7,7 @@ handling dynamic node allocation, similarity-based lookup, and synchronization.
 
 import numpy as np
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 from ..storage.postgres_store import PostgresVectorStore, PostgresGraphStore
@@ -17,12 +17,27 @@ from .graph import GraphMemory
 
 @dataclass
 class MemoryNode:
-    """Metadata for a memory node."""
-    node_index: int  # Index in cognitive engine (0 to N-1)
-    db_id: Optional[int]  # Database ID (if persisted)
+    """
+    Metadata for a memory node with temporal activation tracking.
+    
+    Attributes:
+        node_index: Index in cognitive engine (0 to N-1)
+        db_id: Database ID (if persisted)
+        text: Text content of the memory
+        timestamp: Creation timestamp
+        access_count: Total number of times accessed
+        activation: Current activation level (0-1, decays over time)
+        last_accessed: Timestamp of most recent access
+        access_history: List of access timestamps (for temporal analysis)
+    """
+    node_index: int
+    db_id: Optional[int]
     text: str
     timestamp: float
     access_count: int = 0
+    activation: float = 1.0  # Starts fully activated
+    last_accessed: float = 0.0
+    access_history: List[float] = field(default_factory=list)
 
 
 class SemanticMemoryManager:
@@ -78,6 +93,13 @@ class SemanticMemoryManager:
             'similar_found': 0,
             'sync_count': 0
         }
+        
+        # Temporal activation parameters
+        self.activation_decay_rate = 0.95  # Per time_constant decay
+        self.activation_time_constant = 3600.0  # 1 hour in seconds
+        self.activation_boost_cache = 0.5  # Boost when entering cache
+        self.activation_boost_access = 0.3  # Boost on retrieval
+        self.last_decay_update = time.time()
     
     def allocate_node(self, text: str, embedding: List[float], 
                      db_id: Optional[int] = None) -> int:
@@ -106,12 +128,16 @@ class SemanticMemoryManager:
         self.vector_memory.vectors[node_idx] = embedding_array
         self.vector_memory._normalize()
         
-        # Create metadata
+        # Create metadata with full activation
+        current_time = time.time()
         self.nodes[node_idx] = MemoryNode(
             node_index=node_idx,
             db_id=db_id,
             text=text,
-            timestamp=time.time()
+            timestamp=current_time,
+            activation=1.0,  # New memories start fully activated
+            last_accessed=current_time,
+            access_history=[current_time]
         )
         
         if db_id is not None:
@@ -222,6 +248,155 @@ class SemanticMemoryManager:
     def get_node_metadata(self, node_idx: int) -> Optional[MemoryNode]:
         """Get full metadata for a node."""
         return self.nodes.get(node_idx)
+    
+    # =========================================================================
+    # Temporal Activation System
+    # =========================================================================
+    
+    def access_memory(self, node_idx: int, boost_type: str = 'access') -> None:
+        """
+        Record memory access and boost activation.
+        
+        Call this when a memory is accessed (retrieved, enters cache, etc.)
+        to increase its activation level and record the access time.
+        
+        Args:
+            node_idx: Index of the accessed memory
+            boost_type: Type of access ('cache' = 0.5 boost, 'access' = 0.3 boost)
+        """
+        if node_idx not in self.nodes:
+            return
+        
+        node = self.nodes[node_idx]
+        current_time = time.time()
+        
+        # Determine boost amount
+        if boost_type == 'cache':
+            boost = self.activation_boost_cache
+        else:
+            boost = self.activation_boost_access
+        
+        # Update activation (capped at 1.0)
+        node.activation = min(1.0, node.activation + boost)
+        
+        # Update access tracking
+        node.last_accessed = current_time
+        node.access_count += 1
+        node.access_history.append(current_time)
+        
+        # Trim access history (keep last 100 accesses)
+        if len(node.access_history) > 100:
+            node.access_history = node.access_history[-100:]
+    
+    def update_activation_decay(self) -> None:
+        """
+        Apply activation decay to all memories based on elapsed time.
+        
+        Uses exponential decay: activation *= decay_rate ^ (elapsed / time_constant)
+        
+        Call this periodically (e.g., every few seconds or before dreaming)
+        to simulate the natural decay of memory activation over time.
+        """
+        current_time = time.time()
+        elapsed_since_update = current_time - self.last_decay_update
+        
+        # Skip if very little time has passed
+        if elapsed_since_update < 1.0:
+            return
+        
+        # Compute decay factor
+        decay_factor = self.activation_decay_rate ** (
+            elapsed_since_update / self.activation_time_constant
+        )
+        
+        # Apply decay to all nodes
+        for node in self.nodes.values():
+            node.activation *= decay_factor
+        
+        self.last_decay_update = current_time
+    
+    def get_activation_weights(self) -> np.ndarray:
+        """
+        Get activation levels for all nodes as array.
+        
+        Returns:
+            Array of shape (N,) with activation levels (0-1) for each node.
+            Unallocated nodes have activation 0.
+        """
+        activations = np.zeros(self.N)
+        
+        for idx, node in self.nodes.items():
+            if idx < self.N:
+                activations[idx] = node.activation
+        
+        return activations
+    
+    def get_recent_memories(self, top_k: int = 10) -> List[int]:
+        """
+        Get indices of most recently accessed memories.
+        
+        Args:
+            top_k: Number of memories to return
+            
+        Returns:
+            List of node indices sorted by last_accessed (most recent first)
+        """
+        if not self.nodes:
+            return []
+        
+        sorted_nodes = sorted(
+            self.nodes.values(),
+            key=lambda n: n.last_accessed,
+            reverse=True
+        )
+        
+        return [n.node_index for n in sorted_nodes[:top_k]]
+    
+    def get_high_activation_memories(self, threshold: float = 0.5) -> List[int]:
+        """
+        Get indices of memories with activation above threshold.
+        
+        Args:
+            threshold: Minimum activation level (0-1)
+            
+        Returns:
+            List of node indices with activation >= threshold
+        """
+        return [
+            n.node_index 
+            for n in self.nodes.values() 
+            if n.activation >= threshold
+        ]
+    
+    def compute_temporal_proximity(self, node_i: int, node_j: int, 
+                                   window_seconds: float = 3600.0) -> float:
+        """
+        Compute temporal proximity between two memories.
+        
+        Measures how close in time the memories were last accessed.
+        Uses Gaussian decay so memories accessed at similar times have
+        high proximity, even if that time was long ago.
+        
+        Args:
+            node_i: First memory index
+            node_j: Second memory index
+            window_seconds: Time window for proximity (default 1 hour)
+            
+        Returns:
+            Proximity score 0-1 (1 = accessed at same time)
+        """
+        if node_i not in self.nodes or node_j not in self.nodes:
+            return 0.0
+        
+        time_i = self.nodes[node_i].last_accessed
+        time_j = self.nodes[node_j].last_accessed
+        
+        time_diff = abs(time_i - time_j)
+        
+        # Gaussian decay based on time difference
+        proximity = np.exp(-(time_diff ** 2) / (2 * window_seconds ** 2))
+        
+        return float(proximity)
     
     def sync_to_postgres(self, force: bool = False):
         """

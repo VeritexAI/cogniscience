@@ -34,6 +34,15 @@ from visualization.vector_space import (
     plot_vector_interactive_3d
 )
 
+# Concept visualizations
+from visualization.concept_viz import (
+    plot_concept_graph,
+    plot_activation_heatmap,
+    plot_dual_level_graph,
+    plot_concept_evolution,
+    plot_concept_interactive
+)
+
 __all__ = [
     # Energy
     'plot_energy_evolution',
@@ -54,4 +63,10 @@ __all__ = [
     'plot_similarity_matrix',
     'plot_vector_evolution',
     'plot_vector_interactive_3d',
+    # Concepts
+    'plot_concept_graph',
+    'plot_activation_heatmap',
+    'plot_dual_level_graph',
+    'plot_concept_evolution',
+    'plot_concept_interactive',
 ]
